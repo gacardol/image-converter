@@ -12,29 +12,29 @@ const PORT = process.env.PORT || 3001
 app.use(cors())
 app.use(express.json())
 
-// Serve processed images statically for preview
-app.use('/images', express.static(path.resolve('output/images')))
-
-// API routes
-app.use('/api', apiRoutes)
-
-// Serve built React frontend (production)
+// Serve built React frontend BEFORE API routes
 const publicDir = path.resolve(__dirname, '../public')
 app.use(express.static(publicDir))
 
-// SPA fallback: serve index.html for any non-API route
-app.get('*', (req, res) => {
-  const indexPath = path.join(publicDir, 'index.html')
-  res.sendFile(indexPath, (err) => {
-    if (err) {
-      res.status(200).json({ status: 'ok', message: 'API running. Build frontend with: npm run build' })
-    }
-  })
-})
+// Serve processed images for preview
+app.use('/images', express.static(path.resolve('output/images')))
 
 // Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() })
+})
+
+// API routes
+app.use('/api', apiRoutes)
+
+// SPA catch-all: any non-API route serves index.html
+app.get('*', (req, res) => {
+  const indexPath = path.join(publicDir, 'index.html')
+  res.sendFile(indexPath, (err) => {
+    if (err) {
+      res.status(404).json({ error: 'Frontend not built. Run: npm run build' })
+    }
+  })
 })
 
 app.listen(PORT, () => {
