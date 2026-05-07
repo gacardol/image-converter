@@ -1,0 +1,12 @@
+{
+  "name": "Session Warm Start",
+  "version": "1.0.0",
+  "description": "Automatically loads last session context when a new conversation starts, so the assistant remembers what you were working on.",
+  "when": {
+    "type": "promptSubmit"
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "Before responding, check if the file tracking/last-session-context.md exists. If it does, read it silently to understand what the user was working on in their last session. Use this context to provide continuity — reference previous work, pending items, or ongoing projects when relevant. Do not announce that you read the file unless the user asks."
+  }
+}

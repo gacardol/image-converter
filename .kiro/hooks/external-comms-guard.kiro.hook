@@ -1,0 +1,13 @@
+{
+  "name": "External Communications Guard",
+  "version": "1.0.0",
+  "description": "Asks for confirmation before sending any email, Slack message, or calendar invite on your behalf. Auto-allows messages to yourself.",
+  "when": {
+    "type": "preToolUse",
+    "toolTypes": [".*send.*email.*", ".*send.*message.*", ".*create.*event.*", ".*send.*slack.*", ".*calendar.*invite.*", ".*outlook.*send.*", ".*slack.*post.*"]
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "STOP before executing this tool. Check the recipient(s) of this communication:\n\n- If the ONLY recipient is gacardol (the user themselves), proceed without asking.\n- For ALL other recipients, you MUST show the user a preview of the message including: TO, SUBJECT (if email), and BODY content. Then ask: 'Ready to send this? Say \"send it\" or \"approved\" to confirm, or tell me what to change.'\n- Do NOT send until the user explicitly confirms.\n- If the user already said 'send it' or 'approved' for this exact message in this conversation, do not re-ask."
+  }
+}

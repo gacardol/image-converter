@@ -1,0 +1,36 @@
+{
+  "mcpServers": {
+    "builder-mcp": {
+      "command": "C:\\Users\\gacardol\\AppData\\Local\\Toolbox\\bin\\builder-mcp.exe",
+      "args": [],
+      "env": {},
+      "disabled": false,
+      "autoApprove": []
+    },
+    "aws-outlook-mcp": {
+      "command": "C:\\Users\\gacardol\\AppData\\Local\\Toolbox\\bin\\aws-outlook-mcp.exe",
+      "args": [],
+      "env": {
+        "OUTLOOK_MCP_ENABLE_WRITES": "true"
+      },
+      "disabled": false,
+      "autoApprove": []
+    },
+    "aws-sentral-mcp": {
+      "command": "C:\\Users\\gacardol\\AppData\\Local\\Toolbox\\bin\\aws-sentral-mcp.exe",
+      "args": [],
+      "env": {},
+      "disabled": false,
+      "autoApprove": []
+    },
+    "gandalf-mcp-server": {
+      "command": "C:\\Users\\gacardol\\AppData\\Local\\Toolbox\\bin\\gandalf-mcp-server.exe",
+      "args": [],
+      "env": {},
+      "disabled": false,
+      "autoApprove": [
+        "read_resource"
+      ]
+    }
+  }
+}

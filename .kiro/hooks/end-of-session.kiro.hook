@@ -1,0 +1,12 @@
+{
+  "name": "End of Session",
+  "version": "1.0.0",
+  "description": "Triggered manually when you say 'end of session'. Saves a summary of what was accomplished and what's pending to the tracking file.",
+  "when": {
+    "type": "userTriggered"
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "The user is ending their session. Review the entire conversation and create/update the file tracking/last-session-context.md with the following structure:\n\n# Last Session Context\n## Date: [today's date]\n## Summary\n[2-3 sentence summary of what was accomplished]\n## Key Items Worked On\n[Bulleted list of specific tasks, sellers, or topics discussed]\n## Pending / Next Steps\n[Bulleted list of items that still need attention]\n## Open Questions\n[Any unresolved questions or decisions]\n## Active Sellers / Accounts\n[Any specific sellers or accounts that were discussed, with status]\n\nBe specific — include seller names, opportunity IDs, pipeline stages, and any numbers discussed. This context will be loaded in the next session."
+  }
+}
