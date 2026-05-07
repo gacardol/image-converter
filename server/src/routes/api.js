@@ -18,8 +18,7 @@ const storage = multer.diskStorage({
     cb(null, UPLOAD_DIR)
   },
   filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname)
-    cb(null, `upload_${Date.now()}${ext}`)
+    cb(null, `upload_${Date.now()}${path.extname(file.originalname)}`)
   },
 })
 const upload = multer({
@@ -32,10 +31,10 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
 })
 
-// In-memory job store
+// Job store
 const jobs = new Map()
 
-// POST /api/upload - Upload spreadsheet, return columns + preview
+// POST /api/upload
 router.post('/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'Nenhum arquivo enviado' })
@@ -44,14 +43,9 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     const filePath = req.file.path
     const ext = path.extname(req.file.originalname).toLowerCase()
 
-    // Parse file
     const { columns, rows } = await parseSpreadsheet(filePath, ext)
+    if (rows.length === 0) return res.status(400).json({ error: 'Planilha vazia' })
 
-    if (rows.length === 0) {
-      return res.status(400).json({ error: 'Planilha vazia' })
-    }
-
-    // Detect likely image columns
     const { allImageColumns, primaryColumn } = detectImageColumns(columns, rows)
 
     const job = {
@@ -66,6 +60,7 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       selectedColumns: [],
       results: [],
       progress: { current: 0, total: 0 },
+      summary: { ok: 0, errors: 0, skipped: 0 },
       outputExcelPath: null,
       error: null,
     }
@@ -88,7 +83,7 @@ router.post('/upload', upload.single('file'), async (req, res) => {
   }
 })
 
-// POST /api/process - Start image processing
+// POST /api/process
 router.post('/process', async (req, res) => {
   const { jobId, selectedColumns } = req.body
   const job = jobs.get(jobId)
@@ -100,19 +95,18 @@ router.post('/process', async (req, res) => {
   job.selectedColumns = selectedColumns
   job.status = 'processing'
 
-  // Count total images to process
+  // Count total images
   let totalImages = 0
   for (const row of job.rows) {
     for (const colName of selectedColumns) {
       const colIdx = job.columns.indexOf(colName)
-      if (colIdx >= 0 && row[colIdx] && isUrl(row[colIdx])) totalImages++
+      if (colIdx >= 0 && row[colIdx] && isImageUrl(row[colIdx])) totalImages++
     }
   }
   job.progress = { current: 0, total: totalImages }
+  job.summary = { ok: 0, errors: 0, skipped: 0 }
 
-  // Start processing in background
   runProcessing(job)
-
   res.json({ status: 'processing', totalImages })
 })
 
@@ -123,21 +117,17 @@ router.get('/status/:jobId', (req, res) => {
   res.json({
     status: job.status,
     progress: job.progress,
+    summary: job.summary,
     error: job.error,
     results: job.status === 'done' ? job.results : undefined,
   })
 })
 
-// GET /api/download/:jobId/excel - Download new spreadsheet
+// GET /api/download/:jobId/excel
 router.get('/download/:jobId/excel', async (req, res) => {
   const job = jobs.get(req.params.jobId)
-  if (!job || job.status !== 'done') {
-    return res.status(400).json({ error: 'Processamento não concluído' })
-  }
-
-  if (!job.outputExcelPath) {
-    return res.status(500).json({ error: 'Arquivo de saída não gerado' })
-  }
+  if (!job || job.status !== 'done') return res.status(400).json({ error: 'Não concluído' })
+  if (!job.outputExcelPath) return res.status(500).json({ error: 'Arquivo não gerado' })
 
   const filename = `convertido_${path.basename(job.originalFilename, path.extname(job.originalFilename))}.xlsx`
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
@@ -145,123 +135,140 @@ router.get('/download/:jobId/excel', async (req, res) => {
   res.sendFile(job.outputExcelPath)
 })
 
-// GET /api/download/:jobId/images - Download all images as zip
+// GET /api/download/:jobId/images
 router.get('/download/:jobId/images', async (req, res) => {
   const job = jobs.get(req.params.jobId)
-  if (!job || job.status !== 'done') {
-    return res.status(400).json({ error: 'Processamento não concluído' })
-  }
+  if (!job || job.status !== 'done') return res.status(400).json({ error: 'Não concluído' })
 
   const successResults = job.results.filter(r => r.success && r.finalPath)
-  if (successResults.length === 0) {
-    return res.status(404).json({ error: 'Nenhuma imagem processada' })
-  }
+  if (successResults.length === 0) return res.status(404).json({ error: 'Nenhuma imagem' })
 
   res.setHeader('Content-Type', 'application/zip')
   res.setHeader('Content-Disposition', 'attachment; filename="imagens_amazon.zip"')
 
   const archive = archiver('zip', { zlib: { level: 6 } })
   archive.pipe(res)
-
   for (const result of successResults) {
-    const filename = path.basename(result.finalPath)
-    archive.file(result.finalPath, { name: filename })
+    archive.file(result.finalPath, { name: path.basename(result.finalPath) })
   }
-
   await archive.finalize()
 })
 
 /**
- * Background processing: download, convert, upload each image
+ * Sequential batch processing
  */
 async function runProcessing(job) {
   try {
     const results = []
     let processed = 0
+    // Track status per row (for the Status column)
+    const rowStatus = new Array(job.rows.length).fill(null)
 
     for (let rowIdx = 0; rowIdx < job.rows.length; rowIdx++) {
+      let rowHasImage = false
+      let rowSuccess = true
+      let rowError = ''
+
       for (const colName of job.selectedColumns) {
         const colIdx = job.columns.indexOf(colName)
         if (colIdx < 0) continue
 
         const url = job.rows[rowIdx][colIdx]
-        if (!url || !isUrl(url)) continue
+        if (!url || !isImageUrl(url)) {
+          if (url && !isImageUrl(url)) {
+            // Has value but not a valid image URL — skip
+          }
+          continue
+        }
 
-        const id = `r${rowIdx}_c${colIdx}`
+        rowHasImage = true
+        const id = `r${rowIdx}_c${colIdx}_${Date.now()}`
 
         try {
           const result = await processImage(url, id)
-          // Replace URL in row data
-          job.rows[rowIdx][colIdx] = result.publicUrl || result.finalPath
+          const newUrl = result.publicUrl || url // fallback to original if ImgBB fails
+          job.rows[rowIdx][colIdx] = newUrl
+
           results.push({
-            rowIdx,
-            colIdx,
-            colName,
+            rowIdx, colIdx, colName,
             originalUrl: url,
-            newUrl: result.publicUrl || result.finalPath,
+            newUrl,
             finalPath: result.finalPath,
             success: true,
           })
+          job.summary.ok++
         } catch (err) {
-          console.warn(`[Process] Falha ${id}: ${err.message}`)
+          console.warn(`[Process] Row ${rowIdx + 1}, ${colName}: ${err.message}`)
           results.push({
-            rowIdx,
-            colIdx,
-            colName,
+            rowIdx, colIdx, colName,
             originalUrl: url,
-            newUrl: url, // keep original on failure
+            newUrl: url,
             finalPath: null,
             success: false,
             error: err.message,
           })
+          job.summary.errors++
+          rowSuccess = false
+          rowError = err.message
         }
 
         processed++
         job.progress = { current: processed, total: job.progress.total }
 
-        // 1s delay between images
-        await new Promise(r => setTimeout(r, 1000))
+        // 1.5s delay between images to avoid memory/rate issues
+        await new Promise(r => setTimeout(r, 1500))
+      }
+
+      if (!rowHasImage) {
+        rowStatus[rowIdx] = 'Skipped (sem URL)'
+        job.summary.skipped++
+      } else if (rowSuccess) {
+        rowStatus[rowIdx] = 'OK'
+      } else {
+        rowStatus[rowIdx] = `Error: ${rowError.substring(0, 50)}`
       }
     }
 
     job.results = results
 
-    // Generate output Excel
-    job.outputExcelPath = await generateOutputExcel(job)
+    // Generate output Excel with Status column
+    job.outputExcelPath = await generateOutputExcel(job, rowStatus)
     job.status = 'done'
 
-    const success = results.filter(r => r.success).length
-    console.log(`[Job ${job.id}] Concluído: ${success}/${results.length} imagens`)
+    console.log(`[Job ${job.id}] Done: ${job.summary.ok} OK, ${job.summary.errors} errors, ${job.summary.skipped} skipped`)
   } catch (err) {
-    console.error(`[Job ${job.id}] Erro:`, err.message)
+    console.error(`[Job ${job.id}] Fatal:`, err.message)
     job.status = 'error'
     job.error = err.message
   }
 }
 
 /**
- * Generate output Excel with replaced image URLs
+ * Generate output Excel: original columns + replaced URLs + Status column
  */
-async function generateOutputExcel(job) {
+async function generateOutputExcel(job, rowStatus) {
   await fs.mkdir(path.join(OUTPUT_DIR, 'excel'), { recursive: true })
 
   const workbook = new ExcelJS.Workbook()
   const sheet = workbook.addWorksheet('Produtos')
 
-  // Header row
-  sheet.addRow(job.columns)
+  // Header: original columns + Status
+  const headers = [...job.columns, 'Status']
+  sheet.addRow(headers)
   const headerRow = sheet.getRow(1)
   headerRow.font = { bold: true }
   headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE8E8E8' } }
 
-  // Data rows (with replaced URLs)
-  for (const row of job.rows) {
+  // Data rows
+  for (let i = 0; i < job.rows.length; i++) {
+    const row = [...job.rows[i]]
+    row.push(rowStatus[i] || '')
     sheet.addRow(row)
   }
 
   // Auto-width
   sheet.columns.forEach((col, i) => {
-    col.width = Math.min(Math.max((job.columns[i] || '').length + 4, 12), 50)
+    col.width = Math.min(Math.max((headers[i] || '').length + 4, 12), 50)
   })
 
   const outputPath = path.join(OUTPUT_DIR, 'excel', `output_${job.id.slice(0, 8)}.xlsx`)
@@ -269,9 +276,8 @@ async function generateOutputExcel(job) {
   return outputPath
 }
 
-/**
- * Parse spreadsheet (xlsx or csv)
- */
+// --- Parsing ---
+
 async function parseSpreadsheet(filePath, ext) {
   if (ext === '.csv') return parseCsv(filePath)
   return parseExcel(filePath)
@@ -283,7 +289,6 @@ async function parseExcel(filePath) {
   const sheet = workbook.worksheets[0]
   if (!sheet || sheet.rowCount === 0) throw new Error('Planilha vazia')
 
-  // Find header row
   let headerRowNum = 1
   for (let i = 1; i <= Math.min(10, sheet.rowCount); i++) {
     const row = sheet.getRow(i)
@@ -330,11 +335,12 @@ async function parseCsv(filePath) {
   return { columns, rows }
 }
 
-/**
- * Priority list for the main/cover image column (first match wins)
- */
+// --- Column Detection ---
+
 const PRIMARY_IMAGE_PRIORITY = [
   'ps_item_cover_image',
+  'imagem de capa',
+  'imagem do produto',
   'imagem',
   'imagem 1',
   'image',
@@ -344,55 +350,48 @@ const PRIMARY_IMAGE_PRIORITY = [
   'foto principal',
   'cover_image',
   'main_image',
+  'main-image-url',
 ]
 
-/**
- * Detect which columns likely contain image URLs
- * Returns { allImageColumns, primaryColumn }
- */
+const IMAGE_KEYWORDS = [
+  'imagem', 'image', 'img', 'foto', 'photo', 'picture',
+  'cover', 'capa', 'opção de imagem', 'url', 'link',
+]
+
 function detectImageColumns(columns, rows) {
   const candidates = []
-  const imageKeywords = ['imagem', 'image', 'img', 'foto', 'photo', 'picture', 'url', 'link', 'cover']
 
   for (let i = 0; i < columns.length; i++) {
-    const colLower = columns[i].toLowerCase()
-    const nameMatch = imageKeywords.some(k => colLower.includes(k))
+    const colLower = columns[i].toLowerCase().trim()
 
-    // Check if column values look like URLs
-    let urlCount = 0
-    const sampleSize = Math.min(rows.length, 10)
+    // Check column name matches image keywords
+    const nameMatch = IMAGE_KEYWORDS.some(k => colLower.includes(k))
+
+    // Check if values contain image URLs
+    let imageUrlCount = 0
+    const sampleSize = Math.min(rows.length, 15)
     for (let r = 0; r < sampleSize; r++) {
-      if (rows[r][i] && isUrl(rows[r][i])) urlCount++
+      if (rows[r][i] && isImageUrl(rows[r][i])) imageUrlCount++
     }
-    const hasUrls = urlCount >= sampleSize * 0.3
+    const hasImageUrls = imageUrlCount >= Math.max(1, sampleSize * 0.2)
 
-    if (nameMatch || hasUrls) {
+    if (nameMatch || hasImageUrls) {
       candidates.push(columns[i])
     }
   }
 
-  // Find primary column by priority
+  // Find primary by priority
   let primaryColumn = null
-  for (const priorityName of PRIMARY_IMAGE_PRIORITY) {
-    const match = candidates.find(c => c.toLowerCase() === priorityName)
-    if (match) {
-      primaryColumn = match
-      break
-    }
+  for (const name of PRIMARY_IMAGE_PRIORITY) {
+    const match = candidates.find(c => c.toLowerCase().trim() === name)
+    if (match) { primaryColumn = match; break }
   }
-
-  // If no exact match, try partial match on priority list
   if (!primaryColumn) {
-    for (const priorityName of PRIMARY_IMAGE_PRIORITY) {
-      const match = candidates.find(c => c.toLowerCase().includes(priorityName))
-      if (match) {
-        primaryColumn = match
-        break
-      }
+    for (const name of PRIMARY_IMAGE_PRIORITY) {
+      const match = candidates.find(c => c.toLowerCase().includes(name))
+      if (match) { primaryColumn = match; break }
     }
   }
-
-  // Fallback: first candidate
   if (!primaryColumn && candidates.length > 0) {
     primaryColumn = candidates[0]
   }
@@ -400,9 +399,16 @@ function detectImageColumns(columns, rows) {
   return { allImageColumns: candidates, primaryColumn }
 }
 
-function isUrl(str) {
+function isImageUrl(str) {
   if (!str || typeof str !== 'string') return false
-  return str.startsWith('http://') || str.startsWith('https://')
+  if (!str.startsWith('http://') && !str.startsWith('https://')) return false
+  // Check for image extensions or known image CDNs
+  const lower = str.toLowerCase()
+  const hasImageExt = /\.(jpg|jpeg|png|webp|gif|bmp|tiff)(\?|$|#)/i.test(lower)
+  const isImageCdn = lower.includes('mlstatic') || lower.includes('imgbb') ||
+    lower.includes('shopee') || lower.includes('cloudinary') ||
+    lower.includes('imgur') || lower.includes('images')
+  return hasImageExt || isImageCdn || lower.includes('image') || lower.includes('/img/')
 }
 
 export default router
