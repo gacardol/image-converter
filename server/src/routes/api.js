@@ -92,17 +92,21 @@ router.post('/process', async (req, res) => {
     return res.status(400).json({ error: 'Selecione pelo menos uma coluna de imagem' })
   }
 
-  job.selectedColumns = selectedColumns
-  job.status = 'processing'
+  // Only process the FIRST selected column (main/cover image)
+  const mainColumn = selectedColumns[0]
+  job.selectedColumns = [mainColumn]
 
-  // Count total images
+  // Identify ALL other image columns to clear
+  job.columnsToClean = job.imageColumns.filter(c => c !== mainColumn)
+
+  // Count images to process (only main column)
   let totalImages = 0
+  const mainColIdx = job.columns.indexOf(mainColumn)
   for (const row of job.rows) {
-    for (const colName of selectedColumns) {
-      const colIdx = job.columns.indexOf(colName)
-      if (colIdx >= 0 && row[colIdx] && isImageUrl(row[colIdx])) totalImages++
-    }
+    if (mainColIdx >= 0 && row[mainColIdx] && isImageUrl(row[mainColIdx])) totalImages++
   }
+
+  job.status = 'processing'
   job.progress = { current: 0, total: totalImages }
   job.summary = { ok: 0, errors: 0, skipped: 0 }
 
@@ -155,83 +159,82 @@ router.get('/download/:jobId/images', async (req, res) => {
 })
 
 /**
- * Sequential batch processing
+ * Sequential batch processing:
+ * - Process ONLY the main image column (remove bg, white canvas, upload)
+ * - CLEAR all other image columns
  */
 async function runProcessing(job) {
   try {
     const results = []
     let processed = 0
-    // Track status per row (for the Status column)
     const rowStatus = new Array(job.rows.length).fill(null)
 
-    for (let rowIdx = 0; rowIdx < job.rows.length; rowIdx++) {
-      let rowHasImage = false
-      let rowSuccess = true
-      let rowError = ''
+    const mainColName = job.selectedColumns[0]
+    const mainColIdx = job.columns.indexOf(mainColName)
 
-      for (const colName of job.selectedColumns) {
-        const colIdx = job.columns.indexOf(colName)
-        if (colIdx < 0) continue
-
-        const url = job.rows[rowIdx][colIdx]
-        if (!url || !isImageUrl(url)) {
-          if (url && !isImageUrl(url)) {
-            // Has value but not a valid image URL — skip
-          }
-          continue
-        }
-
-        rowHasImage = true
-        const id = `r${rowIdx}_c${colIdx}_${Date.now()}`
-
-        try {
-          const result = await processImage(url, id)
-          const newUrl = result.publicUrl || url // fallback to original if ImgBB fails
-          job.rows[rowIdx][colIdx] = newUrl
-
-          results.push({
-            rowIdx, colIdx, colName,
-            originalUrl: url,
-            newUrl,
-            finalPath: result.finalPath,
-            success: true,
-          })
-          job.summary.ok++
-        } catch (err) {
-          console.warn(`[Process] Row ${rowIdx + 1}, ${colName}: ${err.message}`)
-          results.push({
-            rowIdx, colIdx, colName,
-            originalUrl: url,
-            newUrl: url,
-            finalPath: null,
-            success: false,
-            error: err.message,
-          })
-          job.summary.errors++
-          rowSuccess = false
-          rowError = err.message
-        }
-
-        processed++
-        job.progress = { current: processed, total: job.progress.total }
-
-        // 1.5s delay between images to avoid memory/rate issues
-        await new Promise(r => setTimeout(r, 1500))
+    // Step 1: Clear ALL other image columns
+    for (const colToClean of (job.columnsToClean || [])) {
+      const cleanIdx = job.columns.indexOf(colToClean)
+      if (cleanIdx < 0) continue
+      for (let rowIdx = 0; rowIdx < job.rows.length; rowIdx++) {
+        job.rows[rowIdx][cleanIdx] = '' // Clear cell
       }
+    }
+    console.log(`[Job ${job.id}] Cleared ${(job.columnsToClean || []).length} secondary image columns`)
 
-      if (!rowHasImage) {
+    // Step 2: Process main image column only
+    for (let rowIdx = 0; rowIdx < job.rows.length; rowIdx++) {
+      const url = job.rows[rowIdx][mainColIdx]
+
+      if (!url || !isImageUrl(url)) {
         rowStatus[rowIdx] = 'Skipped (sem URL)'
         job.summary.skipped++
-      } else if (rowSuccess) {
-        rowStatus[rowIdx] = 'OK'
-      } else {
-        rowStatus[rowIdx] = `Error: ${rowError.substring(0, 50)}`
+        continue
       }
+
+      const id = `r${rowIdx}_${Date.now()}`
+
+      try {
+        const result = await processImage(url, id)
+        const newUrl = result.publicUrl || url
+        job.rows[rowIdx][mainColIdx] = newUrl
+
+        results.push({
+          rowIdx,
+          colIdx: mainColIdx,
+          colName: mainColName,
+          originalUrl: url,
+          newUrl,
+          finalPath: result.finalPath,
+          bgRemoved: result.bgRemoved,
+          success: true,
+        })
+        rowStatus[rowIdx] = 'OK'
+        job.summary.ok++
+      } catch (err) {
+        console.warn(`[Process] Row ${rowIdx + 1}: ${err.message}`)
+        results.push({
+          rowIdx,
+          colIdx: mainColIdx,
+          colName: mainColName,
+          originalUrl: url,
+          newUrl: url,
+          finalPath: null,
+          success: false,
+          error: err.message,
+        })
+        rowStatus[rowIdx] = `Error: ${err.message.substring(0, 50)}`
+        job.summary.errors++
+      }
+
+      processed++
+      job.progress = { current: processed, total: job.progress.total }
+
+      // 1.5s delay between images
+      await new Promise(r => setTimeout(r, 1500))
     }
 
     job.results = results
-
-    // Generate output Excel with Status column
     job.outputExcelPath = await generateOutputExcel(job, rowStatus)
     job.status = 'done'
 
